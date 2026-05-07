@@ -1,14 +1,17 @@
 import contextlib
 import time
 import warnings
-from asyncio import wait_for
+import json
+from asyncio import wait_for, get_running_loop
 from http import HTTPStatus
-from typing import Annotated
+from typing import Annotated, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import RedirectResponse
 from playwright.async_api import Page, Response
+from playwright.async_api import TimeoutError as PWTimeout
 from playwright_captcha import CaptchaType, ClickSolver
+from camoufox import AsyncCamoufox 
 
 from src.consts import CHALLENGE_TITLES
 from src.models import (
@@ -227,24 +230,30 @@ async def _handle_interact(
 async def _handle_post(
     request: LinkRequest, dep: CamoufoxDepClass, timer: TimeoutTimer, start_time: int,
 ) -> LinkResponse:
-    """Handle request.post command."""
-    api_resp = await dep.context.request.post(
-        request.url,
-        form={
-            k: v
-            for pair in request.post_data.split("&")
-            for k, v in [pair.split("=", 1)]
-        }
-        if request.post_data
-        else None,
-        timeout=timer.remaining() * 1000,
-    )
-    status = api_resp.status
-    response_headers = await api_resp.all_headers()
-    response_body = (await api_resp.body()).decode("utf-8", errors="replace")
-    cookies = await dep.context.cookies()
 
-    return LinkResponse(
+    """Handle turnstile-min post command."""
+    if request.post_data and "cftsmin=" in request.post_data.lower() and "sitekey=" in request.post_data.lower():
+        resp = await _handle_post_solve_cftsmin(request, dep, start_time)
+        return resp
+    else:
+        """Handle request.post command."""
+        api_resp = await dep.context.request.post(
+            request.url,
+            form={
+                k: v
+                for pair in request.post_data.split("&")
+                for k, v in [pair.split("=", 1)]
+            }
+            if request.post_data
+            else None,
+            timeout=timer.remaining() * 1000,
+        )
+        status = api_resp.status
+        response_headers = await api_resp.all_headers()
+        response_body = (await api_resp.body()).decode("utf-8", errors="replace")
+        cookies = await dep.context.cookies()
+
+        return LinkResponse(
         message="Success",
         solution=Solution(
             user_agent=await dep.page.evaluate("navigator.userAgent"),
@@ -280,6 +289,179 @@ async def _handle_get(
             response="" if request.return_only_cookies else await dep.page.content(),
         ),
         start_timestamp=start_time,
+    )
+
+
+async def _handle_post_solve_cftsmin(
+    linkrequest: LinkRequest, dep: CamoufoxDep, start_time: int
+) -> LinkResponse:
+
+    # Based on https://github.com/ZFC-Digital/cf-clearance-scraper
+    # Mirrors src/endpoints/solveTurnstile.min.js and src/data/fakePage.html
+    # Requires plain Camouox without techinz/camoufox-add_init_script
+    # and playwright_captcha plugins
+    FAKE_PAGE_TEMPLATE = """<!DOCTYPE html> 
+    <html lang="en">
+
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Turnstile</title>
+    </head>
+
+    <body>
+        <div class="turnstile"></div>
+        <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onloadTurnstileCallback" defer></script>
+        <script>
+            window.onloadTurnstileCallback = function () {
+                turnstile.render('.turnstile', {
+                    sitekey: '<site-key>',
+                    callback: function (token) {
+                        var c = document.createElement('input');
+                        c.type = 'hidden';
+                        c.name = 'cf-response';
+                        c.value = token;
+                        document.body.appendChild(c);
+                    },
+                });
+            };
+
+        </script>
+    </body>
+
+    </html>"""
+
+    # ── parse POST data ──
+    post_data = {}
+    raw = getattr(linkrequest, "post_data", None)
+    if raw is not None:
+        try:
+            text = raw.decode("utf-8", errors="ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
+            for part in text.split("&"):
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    post_data[k] = v
+        except:
+            return LinkResponse(
+                status="Error",
+                message="post data not in correct format",
+                solution=Solution(url=linkrequest.url, status=500),
+                start_timestamp=start_time,
+            )
+
+    if str(post_data.get("cftsmin", "")).lower() not in ("1", "true", "yes"):
+        return LinkResponse(
+            status="Error",
+            message="cftsmin parameter not correct",
+            solution=Solution(url=linkrequest.url, status=500),
+            start_timestamp=start_time,
+        )
+
+    sitekey = post_data.get("siteKey") or post_data.get("sitekey")
+    if not sitekey:
+        return LinkResponse(
+            status="Error",
+            message="Sitekey missing",
+            solution=Solution(url=linkrequest.url, status=500),
+            start_timestamp=start_time,
+        )
+
+    target_url = post_data.get("url") or linkrequest.url
+    timeout = int(getattr(linkrequest, "max_timeout", 60) * 1000)
+
+    # page = dep.page
+    # context = dep.context
+    # --- use clean camoufox without addons (see implementation in utils.py) ---
+    page, context = await dep.switch_to_clean()
+
+    fake_html = FAKE_PAGE_TEMPLATE.replace("<site-key>", sitekey)
+
+    hdrs_future = get_running_loop().create_future()
+
+    async def route_handler(route, request):
+        # In Playwright, the main navigation request is resource_type == "document"
+        if request.resource_type == "document" and request.url in (target_url, target_url.rstrip("/") + "/"):
+            hdrs = dict(request.headers)
+            if not hdrs_future.done():
+                hdrs_future.set_result(hdrs)
+
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=fake_html,
+            )
+            return
+
+        await route.continue_()
+
+    await page.route("**/*", route_handler)
+
+    token = None
+
+    try:
+        try:
+            await page.goto(target_url, wait_until="domcontentloaded")
+        except PWTimeout:
+            pass
+        except Exception:
+            pass
+
+        # Wait until headers were captured (with timeout)
+        try:
+            hdrs = await wait_for(hdrs_future, timeout=10)
+        except:
+            hdrs = {}
+
+        # Wait for Turnstile to CREATE [name="cf-response"] — it does not exist
+        # beforehand, so this selector only matches after a successful solve.
+        # This is exactly what cf-clearance-scraper's waitForSelector does.
+        try:
+            await page.wait_for_selector(
+                '[name="cf-response"]',
+                timeout=timeout,
+                state='attached'
+            )
+        except PWTimeout:
+            pass
+
+        # Read the value property (not the attribute — JS sets the property).
+        token = await page.evaluate(
+            "() => { const el = document.querySelector('[name=\"cf-response\"]'); "
+            "return (el && el.value && el.value.length > 10) ? el.value : null; }"
+        )
+    except:
+        pass
+    finally:
+        try:
+            await page.unroute("**/*", route_handler)
+        except Exception:
+            pass
+
+    if not token:
+        return LinkResponse(
+            status="Error",
+            message="No turnstile token obtained within timeout",
+            solution=Solution(url=linkrequest.url, status=0),
+            start_timestamp=start_time,
+        )
+
+    cookies = await context.cookies()
+    ua = await page.evaluate("() => navigator.userAgent")
+
+    sol = Solution(url=linkrequest.url, status=200)
+    try:
+        setattr(sol, "response", json.dumps({"token": token}))
+        setattr(sol, "cookies", cookies)
+        setattr(sol, "user_agent", ua)
+        setattr(sol, "headers", hdrs)
+    except Exception:
+        pass
+
+    return LinkResponse(
+        message="Success",
+        solution=sol,
+        start_timestamp=start_time,
+        version="1.0"
     )
 
 
