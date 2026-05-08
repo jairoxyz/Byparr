@@ -367,7 +367,7 @@ async def _handle_post_solve_cftsmin(
         )
 
     target_url = post_data.get("url") or linkrequest.url
-    timeout = int(getattr(linkrequest, "max_timeout", 60) * 1000)
+    timeout = int(getattr(linkrequest, "max_timeout", 60000))
 
     # page = dep.page
     # context = dep.context
@@ -399,6 +399,7 @@ async def _handle_post_solve_cftsmin(
     token = None
 
     try:
+        logger.info("Attempting to generate turnstile token...")
         try:
             await page.goto(target_url, wait_until="domcontentloaded")
         except PWTimeout:
@@ -416,13 +417,17 @@ async def _handle_post_solve_cftsmin(
         # beforehand, so this selector only matches after a successful solve.
         # This is exactly what cf-clearance-scraper's waitForSelector does.
         try:
-            await page.wait_for_selector(
-                '[name="cf-response"]',
-                timeout=timeout,
-                state='attached'
+            # add fail-safe asyncio timeout in case playwright timeout doesn't fire
+            await wait_for( 
+                page.wait_for_selector(
+                    '[name="cf-response"]',
+                    state="attached",
+                    timeout=timeout
+                ),
+                timeout=(timeout / 1000) + 1,  # asyncio expects seconds
             )
-        except PWTimeout:
-            pass
+        except (TimeoutError, PWTimeout, Exception):
+            pass  # covers detached frame, navigation, cancellation
 
         # Read the value property (not the attribute — JS sets the property).
         token = await page.evaluate(
