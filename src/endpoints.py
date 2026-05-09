@@ -367,7 +367,7 @@ async def _handle_post_solve_cftsmin(
         )
 
     target_url = post_data.get("url") or linkrequest.url
-    timeout = int(getattr(linkrequest, "max_timeout", 60000))
+    timeout = int(getattr(linkrequest, "max_timeout", 60) * 1000)
 
     # page = dep.page
     # context = dep.context
@@ -418,7 +418,7 @@ async def _handle_post_solve_cftsmin(
         # This is exactly what cf-clearance-scraper's waitForSelector does.
         try:
             # add fail-safe asyncio timeout in case playwright timeout doesn't fire
-            await wait_for( 
+            await wait_for(
                 page.wait_for_selector(
                     '[name="cf-response"]',
                     state="attached",
